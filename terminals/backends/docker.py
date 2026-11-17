@@ -24,7 +24,12 @@ from terminals.utils.context import (
     normalize_context_id,
     get_terminal_id,
 )
-from terminals.utils.env import build_terminal_env
+from terminals.utils.env import NET_ADMIN_ENV_VARS, build_terminal_env
+from terminals.utils.home_quota import (
+    is_mounted as home_is_mounted,
+    prepare_quota_home,
+    wipe_quota_home,
+)
 from terminals.utils.docker_mounts import parse_docker_mounts
 from terminals.utils.parsing import parse_cpu_nanos, parse_memory, parse_size
 from terminals.utils.network_profiles import resolve_network_profile
@@ -63,6 +68,55 @@ class DockerBackend(Backend):
             raise ValueError("Terminal directories must not be symlinks")
         return home
 
+    def _map_to_daemon_path(self, path: Path) -> str:
+        """Map an orchestrator-side data-dir path into Docker-host path space.
+
+        Identity unless ``TERMINALS_DOCKER_HOST_DATA_DIR`` is set (deployments
+        where the orchestrator container's view of the data dir differs from
+        the host path the Docker daemon bind-mounts from).
+        """
+        if not settings.docker_host_data_dir:
+            return str(path)
+        relative = path.relative_to(Path(settings.docker_data_dir))
+        return str(Path(settings.docker_host_data_dir) / relative)
+
+    async def _run_quota_helper(self, helper_image: str, script: str) -> None:
+        """Run *script* inside the host mount namespace via a privileged helper.
+
+        Starts a short-lived ``--privileged --pid=host`` container running
+        ``nsenter -t 1 -m -- sh -c <script>`` and awaits its exit.  Mounts and
+        losetup operations performed this way are visible to the Docker daemon
+        (they happen on the host), which plain in-container mounts are not.
+        """
+        docker = await self._get_docker()
+        await ensure_docker_image(docker, helper_image)
+        config = {
+            "Image": helper_image,
+            "Cmd": ["nsenter", "-t", "1", "-m", "--", "sh", "-c", script],
+            "HostConfig": {
+                "Privileged": True,
+                "PidMode": "host",
+                "NetworkMode": "none",
+            },
+            "Labels": {"app.kubernetes.io/managed-by": "terminals-quota-helper"},
+        }
+        container = await docker.containers.run(config)
+        try:
+            result = await container.wait(timeout=180)
+            code = (result or {}).get("StatusCode", 1)
+            if code != 0:
+                try:
+                    logs = await container.log(stdout=True, stderr=True)
+                    tail = "".join(logs or [])[-400:]
+                except Exception:
+                    tail = ""
+                raise RuntimeError(f"quota helper exited {code}: {tail}")
+        finally:
+            try:
+                await container.delete(force=True)
+            except aiodocker.exceptions.DockerError:
+                pass
+
     # ------------------------------------------------------------------
     # Backend interface
     # ------------------------------------------------------------------
@@ -84,6 +138,34 @@ class DockerBackend(Backend):
             host_data_dir = str(Path(settings.docker_host_data_dir) / relative_home)
         s = spec or {}
 
+        # Home-directory quota: when the policy sets `storage`, back /home/user
+        # with a loop-mounted ext4 image sized from the policy (Docker cannot
+        # quota a bind mount, and StorageOpt only caps the writable layer).
+        # Falls back to the plain bind mount when quotaing is not possible.
+        bind_source = host_data_dir
+        quota = None
+        storage_spec = str(s.get("storage") or "").strip()
+        if storage_spec:
+            quota = await prepare_quota_home(
+                self._home_dir(template_id, context_id),
+                storage_spec,
+                max_storage_spec=settings.max_storage,
+                daemon_path_map=self._map_to_daemon_path,
+                helper_image=settings.docker_quota_helper_image,
+                docker_runner=self._run_quota_helper,
+            )
+            if quota is not None:
+                bind_source = quota.bind_source()
+                log.info(
+                    "Home quota %s active for %s (bind %s)",
+                    storage_spec, workload_name, bind_source,
+                )
+            else:
+                log.warning(
+                    "Home quota %s unavailable for %s — /home/user is unbounded",
+                    storage_spec, workload_name,
+                )
+
         image = s.get("image", settings.image)
         network = profile.get("docker_network", settings.docker_network)
         networks = [name.strip() for name in network.split(",") if name.strip()]
@@ -95,7 +177,7 @@ class DockerBackend(Backend):
             network_name = networks[int(hashlib.sha256(key).hexdigest(), 16) % len(networks)]
 
         host_config: dict = {
-            "Binds": [f"{host_data_dir}:/home/user"],
+            "Binds": [f"{bind_source}:/home/user"],
             "PublishAllPorts": not network_name,
         }
         if self._mounts:
@@ -109,28 +191,29 @@ class DockerBackend(Backend):
         if s.get("cpu_limit"):
             host_config["NanoCpus"] = parse_cpu_nanos(s["cpu_limit"])
 
-        # Storage caps the container's writable layer via StorageOpt — not the
-        # bind-mounted /home/user where user files persist (Docker can't quota a
-        # bind mount).  It also needs a storage driver that supports it (e.g.
-        # overlay2 on xfs with pquota); on others the create below fails, so the
-        # loop drops the quota and retries.  Use Kubernetes for hard limits.
-        if s.get("storage"):
-            host_config["StorageOpt"] = {"size": str(parse_size(s["storage"]))}
+        # Storage caps the container's writable layer via StorageOpt.  This is
+        # only a fallback for deployments where the home quota above is not
+        # available: it never bounds the bind-mounted /home/user (Docker can't
+        # quota a bind mount) and it needs a storage driver that supports it
+        # (e.g. overlay2 on xfs with pquota); on others the create below
+        # fails, so the loop drops the quota and retries.
+        if storage_spec and quota is None:
+            host_config["StorageOpt"] = {"size": str(parse_size(storage_spec))}
             log.info(
-                "Applying storage quota %s to writable layer of %s (/home/user not limited)",
-                s["storage"], workload_name,
+                "Applying storage quota %s to writable layer of %s (home quota unavailable)",
+                storage_spec, workload_name,
             )
 
-        # Egress filtering is handled inside the container (dnsmasq + ipset +
-        # iptables + capsh) triggered by OPEN_TERMINAL_ALLOWED_DOMAINS env var.
-        # Grant CAP_NET_ADMIN so the entrypoint can set up iptables rules
-        # (the capability gets permanently dropped via capsh after setup).
+        # Egress filtering (dnsmasq + ipset + iptables) and the per-connection
+        # download cap (connbytes rule) are set up inside the container and
+        # need CAP_NET_ADMIN, which the entrypoint drops after setup.  Grant
+        # it at create time when any netfilter-based feature is configured.
         terminal_env = build_terminal_env(
             s.get("env", {}),
             cpu_limit=s.get("cpu_limit"),
             memory_limit=s.get("memory_limit"),
         )
-        if "OPEN_TERMINAL_ALLOWED_DOMAINS" in terminal_env:
+        if any(var in terminal_env for var in NET_ADMIN_ENV_VARS):
             host_config["CapAdd"] = ["NET_ADMIN"]
         if network_name:
             host_config["NetworkMode"] = network_name
@@ -349,6 +432,16 @@ class DockerBackend(Backend):
     ) -> None:
         home_dir = self._home_dir(template_id, context_id).resolve()
         home_dir.mkdir(parents=True, exist_ok=True)
+        img = home_dir / "home.img"
+        if img.exists():
+            # Quota-backed home: empty the mounted filesystem (keeping the
+            # image and its mount), or drop both when currently unmounted.
+            if home_is_mounted(home_dir / "home"):
+                wipe_quota_home(home_dir)
+            else:
+                img.unlink(missing_ok=True)
+                shutil.rmtree(home_dir / "home", ignore_errors=True)
+            return
         for child in home_dir.iterdir():
             if child.is_dir() and not child.is_symlink():
                 shutil.rmtree(child)

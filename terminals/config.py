@@ -49,6 +49,9 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("TERMINALS_DOCKER_DATA_DIR", "TERMINALS_DATA_DIR"),
     )
     docker_host_data_dir: str = ""  # optional Docker-host path for docker_data_dir
+    docker_quota_helper_image: str = (
+        "debian:bookworm-slim"  # privileged nsenter helper for home-quota mounts
+    )
 
     @field_validator("docker_host_data_dir")
     @classmethod
