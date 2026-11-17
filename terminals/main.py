@@ -14,6 +14,7 @@ from terminals.db.session import close_db, init_db
 from terminals.logging import setup_logging
 from terminals.middleware import RequestIdMiddleware
 from terminals.routers.terminals import router as terminals_router
+from terminals.routers.policy_compat import router as policy_compat_router
 from terminals.routers.proxy import close_proxy_client, router as proxy_router
 
 
@@ -66,6 +67,10 @@ async def health():
 
 # Template CRUD must be before the catch-all proxy.
 app.include_router(terminals_router)
+
+# Legacy /api/v1/policies aliases (Change Agent's orchestrator integration)
+# must also precede the catch-all proxy.
+app.include_router(policy_compat_router)
 
 FRONTEND_BUILD_DIR = Path(__file__).parent / "frontend" / "build"
 if FRONTEND_BUILD_DIR.exists():
