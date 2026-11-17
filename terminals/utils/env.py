@@ -9,6 +9,11 @@ from terminals.utils.parsing import parse_cpu_nanos, parse_memory
 _DEFAULT_OPEN_TERMINAL_ENV = ("OPEN_TERMINAL_SYSTEM_PROMPT",)
 _RESERVED_CONTAINER_ENV = {"OPEN_TERMINAL_API_KEY"}
 
+# Env vars whose container setup needs CAP_NET_ADMIN (iptables).  The
+# entrypoint drops the capability after setup, so the backend must grant it
+# at create time when any of these are present.
+NET_ADMIN_ENV_VARS = ("OPEN_TERMINAL_ALLOWED_DOMAINS", "OPEN_TERMINAL_MAX_DOWNLOAD_BYTES")
+
 
 def _format_cpu_count(value: str) -> str:
     cores = parse_cpu_nanos(value) / 1_000_000_000

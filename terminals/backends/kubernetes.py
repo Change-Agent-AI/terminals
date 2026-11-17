@@ -23,7 +23,7 @@ from terminals.utils.context import (
     normalize_context_id,
     get_terminal_id,
 )
-from terminals.utils.env import build_terminal_env
+from terminals.utils.env import NET_ADMIN_ENV_VARS, build_terminal_env
 from terminals.utils.kubernetes_security import (
     container_security_context,
     deep_merge,
@@ -252,13 +252,14 @@ class KubernetesBackend(Backend):
         for k, v in terminal_env.items():
             env_vars.append(client.V1EnvVar(name=k, value=str(v)))
 
-        # Egress filtering is handled inside the container (dnsmasq + ipset +
-        # iptables + capsh) triggered by OPEN_TERMINAL_ALLOWED_DOMAINS env var.
-        has_egress_template = "OPEN_TERMINAL_ALLOWED_DOMAINS" in terminal_env
+        # Egress filtering (dnsmasq + ipset + iptables) and the per-connection
+        # download cap (connbytes rule) are set up inside the container and
+        # need CAP_NET_ADMIN, which the entrypoint drops after setup.
+        needs_net_admin = any(var in terminal_env for var in NET_ADMIN_ENV_VARS)
         restricted = restricted_enabled(s)
         pod_security = pod_security_context(s)
         container_security = container_security_context(s)
-        if not container_security and has_egress_template and not restricted:
+        if not container_security and needs_net_admin and not restricted:
             container_security = {
                 "capabilities": {
                     "add": ["NET_ADMIN"],
